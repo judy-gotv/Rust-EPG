@@ -27,12 +27,19 @@
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/judy-gotv/Rust-EPG/main/install.sh | bash -s install
+
+或者
+
+curl -fsSL https://github.com/judy-gotv/Rust-EPG/releases/latest/download/install.sh | bash -s install
 ```
 
 或先下载脚本进入交互菜单：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/judy-gotv/Rust-EPG/main/install.sh -o install.sh
+bash install.sh
+或者
+curl -fsSL https://github.com/judy-gotv/Rust-EPG/releases/latest/download/install.sh
 bash install.sh
 ```
 
