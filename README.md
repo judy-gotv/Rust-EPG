@@ -416,7 +416,7 @@ A: 首页 EPG地址 输入框默认填了本站的 `/epg.xml.gz`。把它替换�
 
 ## 📝 Changelog
 
-### v0.0.2 (latest)
+### v0.0.3 (latest)
 
 - ✨ **新增** 首页支持解析任意外部 EPG URL（`POST /api/v1/parse-url`，下载 → 解压 gzip → 解析 XMLTV → 直接展示，不入库）
 - ✨ **新增** EPG地址输入框默认填入当前域名的 `/epg.xml.gz`，开箱即用
