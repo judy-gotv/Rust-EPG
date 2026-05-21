@@ -43,6 +43,11 @@ curl -fsSL https://github.com/judy-gotv/Rust-EPG/releases/latest/download/instal
 bash install.sh
 ```
 
+### 一行命令升级
+```bash
+curl -fsSL https://github.com/judy-gotv/Rust-EPG/releases/latest/download/install.sh | bash -s update
+```
+
 ### 安装脚本会自动完成
 
 1. ✅ 检测 CPU 架构 (`amd64` / `arm64` / `armv7`)
