@@ -36,6 +36,8 @@
 
 ## 🚀 快速开始 (推荐 - 一键远程安装)
 
+> 💡 **已经装了宝塔面板？** 直接跳到 [🪟 宝塔面板专用教程](#-宝塔面板-bt-panel-专用教程)。
+
 ### 一行命令安装
 
 ```bash
@@ -183,6 +185,151 @@ nginx -t && nginx -s reload
 ```
 
 之后访问 `https://你的域名.com/admin` 即可。
+
+---
+
+## 🪟 宝塔面板 (BT Panel) 专用教程
+
+如果你的服务器已经安装了**宝塔面板**，`install.sh` 会和宝塔的 nginx 冲突（宝塔 nginx 装在 `/www/server/nginx/`，配置目录是 `/www/server/panel/vhost/nginx/`，**不读** `/etc/nginx/conf.d/`）。请按下面流程手动接入：
+
+### Step 1️⃣ 先用 install.sh 安装"后端 + 文件"
+
+只跑后端二进制部署，不让脚本碰 nginx：
+
+```bash
+curl -fsSL https://github.com/judy-gotv/Rust-EPG/releases/latest/download/install.sh | bash -s install
+```
+
+脚本会执行：
+- ✅ 检测 CPU 架构、下载二进制
+- ✅ 创建 `/opt/epg`、初始化 admin/admin123
+- ✅ 启动后端（监听 `127.0.0.1:8080`）
+- ⚠️ 写了一份 `/etc/nginx/conf.d/epg.conf`（**宝塔 nginx 不会读，可以忽略或删掉**）
+
+验证后端通了：
+```bash
+curl http://127.0.0.1:8080/health
+# 期望: {"status":"ok"}
+```
+
+### Step 2️⃣ 宝塔面板 → 添加站点
+
+| 字段 | 填什么 |
+|---|---|
+| 域名 | `epg.yourdomain.com`（你的域名） |
+| 备注 | 随便 |
+| **根目录** | `/opt/epg/app/web` ⚠️ **必须这个，不要让宝塔追加域名后缀** |
+| FTP | 不创建 |
+| 数据库 | 不创建 |
+| PHP 版本 | 纯静态 |
+
+点确定。
+
+### Step 3️⃣ 编辑站点配置文件
+
+进入站点 → 左侧菜单 **配置文件** → 找到 `server { ... }` 块，在 `root /opt/epg/app/web;` **下面**粘贴：
+
+```nginx
+# ===== EPG 配置开始 =====
+
+# 管理 API - Basic Auth 拦截（必须放在 /api/ 前面）
+location /api/v1/admin {
+    auth_basic           "EPG Admin";
+    auth_basic_user_file /opt/epg/epg.htpasswd;
+
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Authorization $http_authorization;
+    proxy_read_timeout 300s;
+}
+
+# 公开 API
+location /api/ {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 300s;
+}
+
+# 健康检查 / Prometheus
+location ~ ^/(health|metrics)$ {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Host $host;
+}
+
+# EPG 订阅地址 (XMLTV / DIYP)
+location ~ ^/(epg\.xml|epg\.xml\.gz|e\.xml|e\.xml\.gz|diyp|epg/diyp)$ {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 300s;
+}
+
+# 前端 SPA - 必须放最后（兜底）
+location / {
+    try_files $uri $uri/ /index.html;
+}
+
+# ===== EPG 配置结束 =====
+```
+
+⚠️ **如果你看到 `#PROXY-START/ ... #PROXY-END/` 段落**（宝塔反向代理生成的），整段**删掉**，避免把全站都代理到 8080。
+
+按 **Ctrl + S** 保存，宝塔会自动 `nginx -t` 校验，绿色提示就 OK。
+
+### Step 4️⃣ 申请 SSL 证书
+
+站点设置 → 左侧 **SSL** → Let's Encrypt → 勾选域名 → 申请 → 申请成功后开启 **强制 HTTPS**。
+
+### Step 5️⃣ 验证
+
+```bash
+# 前端首页应该返回 HTML
+curl -I https://epg.yourdomain.com/
+
+# 公开 API 应该返回 200
+curl -I https://epg.yourdomain.com/api/v1/channels
+
+# 管理 API 不带密码应该返回 401（重点：证明 auth_basic 生效）
+curl -I https://epg.yourdomain.com/api/v1/admin/sources
+# HTTP/1.1 401 Unauthorized ✅
+
+# XMLTV 订阅应该返回 XML
+curl -I https://epg.yourdomain.com/epg.xml.gz
+# Content-Type: application/gzip ✅
+```
+
+浏览器访问 `https://epg.yourdomain.com/admin` → 弹登录框 → `admin / admin123` ✅
+
+### Step 6️⃣ （可选）让 install.sh 不再插嘴
+
+宝塔模式下不需要 install.sh 自动改 nginx，可以让它"只装后端不动 nginx"：
+
+```bash
+# 升级时只下二进制 + 重启后端，不碰 nginx 配置
+bash install.sh update
+```
+
+`update` 命令只覆盖二进制，不重写 nginx 站点，宝塔配置永远不丢。
+
+### ⚠️ 宝塔用户常见坑
+
+| 坑 | 解决 |
+|---|---|
+| 浏览器打开域名是宝塔默认页 | 站点没绑对域名 / 没解析到本机 IP |
+| `https://你的域名/admin` 返回 JSON 而不是 HTML | 反代顺序写反了，`location /` 写到 `/api/` 前面会被截胡。**确保 `location /` 在最后** |
+| `/api/v1/admin` 直接进去不要密码 | `auth_basic_user_file` 路径写错或文件不存在，检查 `ls -la /opt/epg/epg.htpasswd` |
+| `502 Bad Gateway` | 后端没启动。`curl http://127.0.0.1:8080/health` 测试，并查 `tail /opt/epg/app/logs/server.log` |
+| 改完密码网页没掉线 | 浏览器缓存了 Basic Auth 凭证，关浏览器重开或用隐身窗口 |
+| 域名首页 404 | 网站目录写成了 `/opt/epg/app/web/epg.yourdomain.com`（多了一层）。删站点重建，根目录就填 `/opt/epg/app/web` |
 
 ---
 
