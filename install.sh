@@ -37,10 +37,17 @@ DEFAULT_USER="${EPG_DEFAULT_USER:-admin}"
 DEFAULT_PASS="${EPG_DEFAULT_PASS:-admin123}"
 HTPASSWD_PATH="${EPG_HTPASSWD_PATH:-$EPG_DIR/epg.htpasswd}"
 
-# GitHub 下载地址
-URL_AMD64="https://github.com/judy-gotv/Rust-EPG/raw/main/epg-linux-amd64.tar.gz"
-URL_ARM64="https://github.com/judy-gotv/Rust-EPG/raw/main/epg-linux-arm64.tar.gz"
-URL_ARMV7="https://github.com/judy-gotv/Rust-EPG/raw/main/epg-linux-armv7.tar.gz"
+# GitHub 下载地址 (Releases - latest 自动指向最新版本)
+GH_REPO="judy-gotv/Rust-EPG"
+GH_RELEASE_TAG="${GH_RELEASE_TAG:-latest}"   # 可指定具体版本号，如 0.0.1
+if [ "$GH_RELEASE_TAG" = "latest" ]; then
+  GH_BASE="https://github.com/${GH_REPO}/releases/latest/download"
+else
+  GH_BASE="https://github.com/${GH_REPO}/releases/download/${GH_RELEASE_TAG}"
+fi
+URL_AMD64="${GH_BASE}/epg-linux-amd64.tar.gz"
+URL_ARM64="${GH_BASE}/epg-linux-arm64.tar.gz"
+URL_ARMV7="${GH_BASE}/epg-linux-armv7.tar.gz"
 
 # ---------------- sudo 检测 ----------------
 SUDO=""
@@ -253,7 +260,23 @@ server {
         try_files \$uri \$uri/ /index.html;
     }
 
-    # 后端 API 反向代理
+    # ⚠️ 管理 API - 必须放在 /api/ 之前，加 Basic Auth
+    # 后端本身不做鉴权，由 nginx 负责
+    location /api/v1/admin {
+        auth_basic           "EPG Admin";
+        auth_basic_user_file ${HTPASSWD_PATH};
+
+        proxy_pass http://127.0.0.1:${BACKEND_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Authorization \$http_authorization;
+        proxy_read_timeout 300s;
+    }
+
+    # 公开 API
     location /api/ {
         proxy_pass http://127.0.0.1:${BACKEND_PORT};
         proxy_http_version 1.1;
@@ -350,12 +373,20 @@ start_services() {
   # 软链 data -> EPG_DIR/data，让二进制读到 ./data/epg.db
   ln -sfn "$EPG_DIR/data" "$INSTALL_DIR/data" 2>/dev/null || $SUDO ln -sfn "$EPG_DIR/data" "$INSTALL_DIR/data"
 
+  # ⚠️ 强制后端只绑定 127.0.0.1（安全：后端无鉴权，必须由 nginx 拦截）
+  if [ -f "$INSTALL_DIR/config.yml" ]; then
+    if grep -q 'host: "0.0.0.0"' "$INSTALL_DIR/config.yml" 2>/dev/null; then
+      $SUDO sed -i 's/host: "0.0.0.0"/host: "127.0.0.1"/' "$INSTALL_DIR/config.yml"
+      warn "  - 已将后端绑定改为 127.0.0.1 (避免裸奔)"
+    fi
+  fi
+
   cd "$INSTALL_DIR"
   EPG_HTPASSWD_PATH="$HTPASSWD_PATH" \
     nohup ./epg-server > "$INSTALL_DIR/logs/server.log" 2>&1 &
   local spid=$!
   echo $spid > "$INSTALL_DIR/logs/server.pid"
-  log "  - 后端 PID=$spid (监听 127.0.0.1:${BACKEND_PORT})"
+  log "  - 后端 PID=$spid (监听 127.0.0.1:${BACKEND_PORT}, 仅本机, 由 nginx 反代)"
 
   # 前端由 nginx 托管 + 反代 API
   setup_nginx
