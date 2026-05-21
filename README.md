@@ -6,10 +6,16 @@
 
 ---
 
-演示站
+## 🌐 在线演示
 
-https://epg.passwd.bond
+| 入口 | 链接 |
+|---|---|
+| 🏠 首页 (频道+节目+在线解析) | https://epg.passwd.bond |
+| 🔐 后台管理 | https://epg.passwd.bond/admin |
+| 📡 XMLTV 订阅 | https://epg.passwd.bond/epg.xml.gz |
+| 📺 DIYP 订阅 | https://epg.passwd.bond/diyp |
 
+---
 
 ## ✨ 特性
 
@@ -17,10 +23,12 @@ https://epg.passwd.bond
 - 🌐 **多架构** — 预编译 `linux/amd64` `linux/arm64` `linux/arm/v7` 三个架构的二进制
 - 📦 **零依赖部署** — 静态链接 + rustls (无需 OpenSSL)，glibc 2.17 兼容 (CentOS 7+/Ubuntu 18.04+)
 - 🔌 **多源采集** — 支持 XMLTV / JSON / CSV 数据源，定时同步
-- 🔐 **HTTP Basic 鉴权** — 后台管理使用 htpasswd，bcrypt 加密
-- 🎨 **现代化 UI** — Vue 3 + Element Plus 响应式后台
+- 🔗 **在线解析外部 EPG** — 首页直接输入任意 XMLTV URL 即可加载预览（无需入库）
+- 🔐 **HTTP Basic 鉴权** — 后台管理由 nginx 拦截，bcrypt 加密
+- 🛡️ **后端默认绑 127.0.0.1** — 必须经由 nginx 反代，杜绝裸奔
+- 🎨 **现代化 UI** — Vue 3 + Element Plus 响应式界面
 - 📊 **Prometheus 指标** — 内置 `/metrics` 监控端点
-- 📤 **多格式导出** — XMLTV / XML / JSON / CSV
+- 📤 **IPTV 订阅地址** — XMLTV / DIYP 多种格式，开箱即用
 - ⏰ **定时任务** — cron 表达式调度采集与清理
 - 🐳 **Docker 支持** — 同时提供 docker-compose 方式
 
@@ -262,24 +270,38 @@ epg-web    : 8081
 
 ## 📡 API 文档
 
-### 公开 API
+### 公开 API (无需鉴权)
 
 | 路径 | 方法 | 说明 |
 |---|---|---|
 | `/health` | GET | 健康检查 |
 | `/metrics` | GET | Prometheus 指标 |
-| `/api/v1/channels` | GET | 频道列表 |
+| `/api/v1/channels?page=1&page_size=1000` | GET | 频道列表（page_size 最大 5000） |
 | `/api/v1/channels/:code` | GET | 频道详情 |
 | `/api/v1/categories` | GET | 分类列表 |
-| `/api/v1/programs` | GET | 节目列表 |
-| `/api/v1/programs/current` | GET | 正在播放 |
-| `/api/v1/programs/next` | GET | 下一个节目 |
+| `/api/v1/programs?channel_code=xxx&start=...&end=...` | GET | 节目列表 |
+| `/api/v1/programs/current?channel_code=xxx` | GET | 正在播放 |
+| `/api/v1/programs/next?channel_code=xxx` | GET | 下一个节目 |
 | `/api/v1/search?q=xxx` | GET | 全文检索 |
-| `/export/xmltv` | GET | 导出 XMLTV |
-| `/export/json` | GET | 导出 JSON |
-| `/export/csv` | GET | 导出 CSV |
+| `/api/v1/parse-url` | POST | **解析任意外部 XMLTV URL** (body: `{"url":"..."}`，不入库) |
+| `/api/v1/theme` | GET | 获取当前主题 |
 
-### 管理 API (需 Basic Auth)
+### IPTV 订阅地址 (无需鉴权)
+
+| 路径 | 用途 |
+|---|---|
+| `/epg.xml` | XMLTV (Kodi / Jellyfin / IPTV Smarters / m3u 通用) |
+| `/epg.xml.gz` | XMLTV gzip 压缩版 ⭐ 推荐 |
+| `/e.xml` `/e.xml.gz` | 上面的别名 |
+| `/diyp` 或 `/epg/diyp` | DIYP / TVBox / 影视仓 JSON 格式 |
+
+可选参数：
+```
+?days=7              # 天数（默认 7，最大 30）
+?channels=cctv1,cctv2 # 只导出指定频道（逗号分隔）
+```
+
+### 管理 API (需 Basic Auth - 由 nginx 拦截)
 
 | 路径 | 方法 | 说明 |
 |---|---|---|
@@ -287,6 +309,7 @@ epg-web    : 8081
 | `/api/v1/admin/sources/:id` | PUT/DELETE | 修改/删除数据源 |
 | `/api/v1/admin/sources/:id/sync` | POST | 手动触发同步 |
 | `/api/v1/admin/channels` | POST | 创建频道 |
+| `/api/v1/admin/channels/:id` | DELETE | 删除频道 |
 | `/api/v1/admin/sync/logs` | GET | 同步日志 |
 | `/api/v1/admin/mappings/channel` | GET/POST | 频道映射 |
 | `/api/v1/admin/mappings/field` | GET/POST | 字段映射 |
@@ -385,6 +408,32 @@ A: 不必须，没装就关闭缓存，性能会差一点。装 Redis：`docker 
 
 ### Q: 如何配置 HTTPS？
 A: 见上面 [配置域名 + HTTPS](#-配置域名--https)。
+
+### Q: 如何在线预览别人家的 EPG？
+A: 首页 EPG地址 输入框默认填了本站的 `/epg.xml.gz`。把它替换成任意 `https://xxx.com/epg.xml.gz` → 点【加載數據】即可预览（仅前端展示，不入库）。
+
+---
+
+## 📝 Changelog
+
+### v0.0.2 (latest)
+
+- ✨ **新增** 首页支持解析任意外部 EPG URL（`POST /api/v1/parse-url`，下载 → 解压 gzip → 解析 XMLTV → 直接展示，不入库）
+- ✨ **新增** EPG地址输入框默认填入当前域名的 `/epg.xml.gz`，开箱即用
+- 🐛 **修复** 频道列表只显示 500 个的 bug（后端 page_size 上限从 500 提到 5000，前端改为自动分页）
+- 🐛 **修复** 主页 URL 默认重定向到 `/channels` 的问题（现在停在 `/`）
+- 🔒 **安全** 后端默认绑定 `127.0.0.1`，必须经由 nginx 反代（避免管理 API 裸奔）
+- 🔒 **安全** nginx 配置加入 `auth_basic` 拦截 `/api/v1/admin/*`
+- 🔧 **改进** axios 超时从 15s 提到 120s（解析大 EPG 包不再卡死）
+
+### v0.0.1
+
+- 🎉 首个发布版本
+- 多源 EPG 采集（XMLTV / JSON / CSV）
+- IPTV 订阅地址（XMLTV / DIYP）
+- HTTP Basic 鉴权 + bcrypt
+- 定时任务 + Prometheus 监控
+- 三架构预编译二进制（amd64 / arm64 / armv7）
 
 ---
 
