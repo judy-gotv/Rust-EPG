@@ -591,7 +591,69 @@ A: 改 `FRONTEND_PORT` 环境变量重新安装：`FRONTEND_PORT=9999 bash insta
 A: 不会。升级（菜单选项 3）只覆盖二进制，`/opt/epg/data/epg.db` 不动。
 
 ### Q: Redis 必须装吗？
-A: 不必须，没装就关闭缓存，性能会差一点。装 Redis：`docker run -d --restart unless-stopped -p 127.0.0.1:6379:6379 redis:7-alpine`
+A: 不必须，没装就关闭缓存，性能会差一点。推荐安装，特别是小内存机器（≤2GB）开启缓存后接口响应明显更快。
+
+**方式 A — Docker（推荐，最干净）**
+```bash
+docker run -d --name epg-redis --restart unless-stopped \
+  -p 127.0.0.1:6379:6379 \
+  redis:7-alpine redis-server --maxmemory 100mb --maxmemory-policy allkeys-lru
+```
+
+**方式 B — Debian/Ubuntu apt 原生安装**
+```bash
+# 1. 安装
+apt update && apt install -y redis-server
+
+# 2. 设内存上限（1.9GB 小机器必须，否则可能 OOM）
+sed -i 's/^# *maxmemory .*/maxmemory 100mb/' /etc/redis/redis.conf
+sed -i 's/^# *maxmemory-policy .*/maxmemory-policy allkeys-lru/' /etc/redis/redis.conf
+
+# 3. 启动并设为开机自启
+systemctl reset-failed redis-server
+systemctl enable --now redis-server
+
+# 4. 验证
+systemctl status redis-server --no-pager -l | head -10
+redis-cli ping                       # 期望: PONG
+redis-cli config get maxmemory       # 期望: 104857600
+
+# 5. 重启 EPG 连上
+/opt/epg/app/run.sh restart
+sleep 3
+tail -20 /opt/epg/app/logs/server.log | grep -i redis
+# 期望: "Redis 连接成功: redis://127.0.0.1:6379/0"
+```
+
+**方式 C — CentOS/RHEL**
+```bash
+yum install -y epel-release && yum install -y redis
+# 同上修改 /etc/redis.conf 的 maxmemory
+systemctl enable --now redis
+```
+
+#### ⚠️ Redis 安装常见坑
+
+| 坑 | 解决 |
+|---|---|
+| `systemctl start redis-server` 失败 EADDRINUSE | 端口被旧 redis 占用：`ss -tlnp \| grep 6379` 找到 PID 后 `kill <pid>`，再 systemctl 启动 |
+| `libjemalloc.so.2: failed to map segment` | 宝塔残留库冲突：`mv /usr/local/lib/libjemalloc.so.2 /root/bt-residue-backup/` 后重启 |
+| `Can't open the log file: Permission denied` | 目录被误删：`mkdir -p /var/log/redis /var/lib/redis /run/redis && chown -R redis:redis /var/log/redis /var/lib/redis /run/redis` |
+| 宝塔面板装 Redis 8.x 编译失败 OOM | 1GB 以下小机器编译会爆，直接走上面方式 B 用 apt 装 7.x 完全够用 |
+| EPG 日志一直"Redis 连接失败" | `redis-cli ping` 不返回 PONG 说明 redis 没起，先按上面 4 步排查；返回 PONG 但 EPG 报错就检查 `config.yml` 里 `redis.url` 是否 `redis://127.0.0.1:6379/0` |
+
+#### 查看缓存效果
+
+```bash
+# 缓存条数
+redis-cli keys 'epg:*' | wc -l
+
+# 缓存占用内存
+redis-cli info memory | grep used_memory_human
+
+# 命中率（hit / (hit + miss)，正常 > 80%）
+redis-cli info stats | grep -E 'keyspace_hits|keyspace_misses'
+```
 
 ### Q: 如何配置 HTTPS？
 A: 见上面 [配置域名 + HTTPS](#-配置域名--https)。
@@ -620,7 +682,7 @@ A: 首页 EPG地址 输入框默认填了本站的 `/epg.xml.gz`。把它替换�
 - 🔒 **安全** 后端默认绑定 `127.0.0.1`，必须经由 nginx 反代
 - 🔧 **改进** axios 超时从 15s 提到 120s（解析大 EPG 包不再卡死）
 
-### ⚠️ 从 v0.0.6 升级到 v0.0.8 注意
+### ⚠️ 从 v0.0.2 升级到 v0.0.3 注意
 
 如果是 `install.sh` 一键安装的：直接 `bash install.sh update` 即可（会自动重写 nginx 配置）。
 
