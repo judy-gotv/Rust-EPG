@@ -456,6 +456,91 @@ print_banner() {
   echo -e "${GREEN}============================================${NC}"
 }
 
+# ---------------- Redis 安装/修复 ----------------
+# 用 apt/yum 装 redis,设 100MB 上限 + LRU 淘汰,systemd 接管。
+# 已装且能 ping 通则只校验+保证 maxmemory; 端口被野进程占了就 kill 后交给 systemd。
+setup_redis() {
+  step "Redis 安装/检查"
+
+  # 1. 已能 ping 通就只检 maxmemory
+  if command -v redis-cli >/dev/null 2>&1 && redis-cli ping 2>/dev/null | grep -q PONG; then
+    log "Redis 已运行: $(redis-cli ping)"
+    local mm; mm="$(redis-cli config get maxmemory 2>/dev/null | tail -1)"
+    if [ "$mm" = "0" ]; then
+      warn "Redis 未设 maxmemory,小内存机器可能 OOM,自动设为 100mb"
+      redis-cli config set maxmemory 104857600 >/dev/null 2>&1 || true
+      redis-cli config set maxmemory-policy allkeys-lru >/dev/null 2>&1 || true
+      redis-cli config rewrite >/dev/null 2>&1 || true
+    fi
+    return 0
+  fi
+
+  # 2. 检测包管理器
+  local pm=""
+  if command -v apt-get >/dev/null 2>&1; then pm="apt"
+  elif command -v dnf >/dev/null 2>&1; then pm="dnf"
+  elif command -v yum >/dev/null 2>&1; then pm="yum"
+  else
+    warn "未识别的包管理器,跳过 Redis 安装(可手动 docker run redis:7-alpine 或参考 README)"
+    return 0
+  fi
+
+  # 3. 安装
+  log "通过 $pm 安装 redis-server..."
+  case "$pm" in
+    apt) $SUDO apt-get update -y >/dev/null 2>&1 || true
+         $SUDO apt-get install -y redis-server >/dev/null 2>&1 \
+           || { warn "apt 安装 redis-server 失败,跳过"; return 0; } ;;
+    dnf|yum)
+         $SUDO $pm install -y epel-release >/dev/null 2>&1 || true
+         $SUDO $pm install -y redis >/dev/null 2>&1 \
+           || { warn "$pm 安装 redis 失败,跳过"; return 0; } ;;
+  esac
+
+  # 4. 设 maxmemory
+  local conf=""
+  for c in /etc/redis/redis.conf /etc/redis.conf; do
+    [ -f "$c" ] && { conf="$c"; break; }
+  done
+  if [ -n "$conf" ]; then
+    $SUDO sed -i 's/^# *maxmemory .*/maxmemory 100mb/' "$conf"
+    $SUDO sed -i 's/^# *maxmemory-policy .*/maxmemory-policy allkeys-lru/' "$conf"
+    grep -qE '^maxmemory ' "$conf" || echo "maxmemory 100mb"           | $SUDO tee -a "$conf" >/dev/null
+    grep -qE '^maxmemory-policy ' "$conf" || echo "maxmemory-policy allkeys-lru" | $SUDO tee -a "$conf" >/dev/null
+    log "已设置 maxmemory=100mb (allkeys-lru) -> $conf"
+  fi
+
+  # 5. 处理端口被野 redis 占用的情况(我们这次实战碰到过)
+  local hold_pid
+  hold_pid="$(ss -tlnp 2>/dev/null | awk '/:6379 /{print $0}' | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)"
+  if [ -n "$hold_pid" ] && ! systemctl is-active --quiet redis-server 2>/dev/null && ! systemctl is-active --quiet redis 2>/dev/null; then
+    warn "端口 6379 被野 redis PID=$hold_pid 占用,kill 后交给 systemd"
+    $SUDO kill "$hold_pid" 2>/dev/null || true
+    sleep 1
+  fi
+
+  # 6. systemd 启动
+  local svc=""
+  for s in redis-server redis; do
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${s}.service"; then svc="$s"; break; fi
+  done
+  if [ -z "$svc" ]; then
+    warn "找不到 redis systemd unit,跳过自启动设置"
+    return 0
+  fi
+  $SUDO systemctl reset-failed "$svc" 2>/dev/null || true
+  $SUDO systemctl enable --now "$svc" >/dev/null 2>&1 || true
+  sleep 1
+
+  # 7. 验证
+  if redis-cli ping 2>/dev/null | grep -q PONG; then
+    log "✅ Redis 启动成功 ($svc): $(redis-cli ping)"
+  else
+    warn "Redis 启动失败,请运行: systemctl status $svc -l"
+    warn "常见问题见 README 的「Redis 安装常见坑」"
+  fi
+}
+
 # ---------------- 主动作 ----------------
 do_install() {
   local arch="${1:-}"
@@ -468,6 +553,7 @@ do_install() {
   prepare_dirs
   download_pkg "$arch"
   init_account
+  setup_redis
   stop_services
   start_services
   print_banner "$arch"
@@ -553,6 +639,7 @@ show_menu() {
   echo -e "  ${GREEN}6)${NC}  查看运行状态"
   echo -e "  ${GREEN}7)${NC}  查看实时日志"
   echo -e "  ${RED}8)${NC}  卸载 (恢复原始状态)"
+  echo -e "  ${GREEN}9)${NC}  安装/修复 Redis (apt+systemd, 100MB上限)"
   echo -e "  ${YELLOW}0)${NC}  退出"
   echo -e "${BLUE}============================================${NC}"
 }
@@ -560,7 +647,7 @@ show_menu() {
 menu_loop() {
   while true; do
     show_menu
-    read -r -p "请选择 [0-8]: " choice
+    read -r -p "请选择 [0-9]: " choice
     case "$choice" in
       1) do_install auto;  read -r -p "按回车返回菜单..." _ ;;
       2)
@@ -579,6 +666,7 @@ menu_loop() {
       6) do_status;     read -r -p "按回车返回菜单..." _ ;;
       7) do_logs ;;
       8) do_uninstall;  read -r -p "按回车返回菜单..." _ ;;
+      9) setup_redis;   read -r -p "按回车返回菜单..." _ ;;
       0) echo "Bye 👋"; exit 0 ;;
       *) warn "无效选择: $choice"; sleep 1 ;;
     esac
@@ -597,6 +685,7 @@ case "${1:-}" in
   status)             do_status ;;
   logs)               do_logs ;;
   uninstall|remove)   do_uninstall ;;
+  redis|setup-redis)  setup_redis ;;
   menu|"")            menu_loop ;;
   -h|--help|help)
     cat <<EOF
@@ -609,6 +698,7 @@ EPG 系统一键安装脚本
   bash $0 start|stop       # 启停服务
   bash $0 status           # 查看状态
   bash $0 logs             # 实时日志
+  bash $0 redis            # 单独安装/修复 Redis
   bash $0 uninstall        # 卸载
 
 环境变量:
