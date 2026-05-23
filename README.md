@@ -24,9 +24,9 @@
 - 📦 **零依赖部署** — 静态链接 + rustls (无需 OpenSSL)，glibc 2.17 兼容 (CentOS 7+/Ubuntu 18.04+)
 - 🔌 **多源采集** — 支持 XMLTV / JSON / CSV 数据源，定时同步
 - 🔗 **在线解析外部 EPG** — 首页直接输入任意 XMLTV URL 即可加载预览（无需入库）
-- 🔐 **HTTP Basic 鉴权** — 后台管理由 nginx 拦截，bcrypt 加密
+- 🔐 **自定义登录页 + Token 鉴权** — 后端读 htpasswd (bcrypt) 校验，签发 Cookie+Bearer Token，7 天有效
 - 🛡️ **后端默认绑 127.0.0.1** — 必须经由 nginx 反代，杜绝裸奔
-- 🎨 **现代化 UI** — Vue 3 + Element Plus 响应式界面
+- 🎨 **47 套主题** — Vue 3 + Element Plus，动漫 / 极简 / 像素 / 蒸汽朋克 / 樱花 / 圣诞 等
 - 📊 **Prometheus 指标** — 内置 `/metrics` 监控端点
 - 📤 **IPTV 订阅地址** — XMLTV / DIYP 多种格式，开箱即用
 - ⏰ **定时任务** — cron 表达式调度采集与清理
@@ -77,13 +77,15 @@ curl -fsSL https://github.com/judy-gotv/Rust-EPG/releases/latest/download/instal
 
 ```
 前端首页 : http://<服务器IP>:8081
-后台管理 : http://<服务器IP>:8081/admin    👈 登录入口
+登录页面 : http://<服务器IP>:8081/login    👈 美化的自定义登录页
+后台管理 : http://<服务器IP>:8081/admin    (未登录会自动跳 /login)
 
 默认账号 : admin
 默认密码 : admin123
 ```
 
 > ⚠️ **首次登录后请立即在后台修改密码！**
+> 💡 v0.0.3 起改用前端登录页 + Token 鉴权（7 天有效），不再使用浏览器原生密码弹窗。
 
 ---
 
@@ -232,19 +234,30 @@ curl http://127.0.0.1:8080/health
 ```nginx
 # ===== EPG 配置开始 =====
 
-# 管理 API - Basic Auth 拦截（必须放在 /api/ 前面）
+# 管理 API - 由后端做登录鉴权（Cookie + Bearer Token），nginx 不再 auth_basic
 location /api/v1/admin {
-    auth_basic           "EPG Admin";
-    auth_basic_user_file /opt/epg/epg.htpasswd;
-
     proxy_pass http://127.0.0.1:8080;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Cookie $http_cookie;
     proxy_set_header Authorization $http_authorization;
     proxy_read_timeout 300s;
+}
+
+# 登录 / 登出 / 当前用户（公开）
+location /api/v1/auth {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Cookie $http_cookie;
+    proxy_set_header Authorization $http_authorization;
+    proxy_read_timeout 60s;
 }
 
 # 公开 API
@@ -281,6 +294,8 @@ location / {
 # ===== EPG 配置结束 =====
 ```
 
+⚠️ **从 v0.0.2 旧配置升级**：把原来的 `auth_basic` 和 `auth_basic_user_file` 两行**删掉**，并新增上面的 `location /api/v1/auth { ... }` 块。否则浏览器仍会弹原生密码框，新的自定义登录页也无法登录。
+
 ⚠️ **如果你看到 `#PROXY-START/ ... #PROXY-END/` 段落**（宝塔反向代理生成的），整段**删掉**，避免把全站都代理到 8080。
 
 按 **Ctrl + S** 保存，宝塔会自动 `nginx -t` 校验，绿色提示就 OK。
@@ -298,16 +313,24 @@ curl -I https://epg.yourdomain.com/
 # 公开 API 应该返回 200
 curl -I https://epg.yourdomain.com/api/v1/channels
 
-# 管理 API 不带密码应该返回 401（重点：证明 auth_basic 生效）
-curl -I https://epg.yourdomain.com/api/v1/admin/sources
-# HTTP/1.1 401 Unauthorized ✅
+# 管理 API 不带 token 应该返回 401 JSON（不应该有 WWW-Authenticate: Basic 头）
+curl -i https://epg.yourdomain.com/api/v1/admin/sources
+# HTTP/1.1 401 Unauthorized
+# {"code":401,"message":"未授权: ..."}
+# ⚠️ 如果响应头出现 WWW-Authenticate: Basic 说明 auth_basic 没删干净
+
+# 登录端点应该可用
+curl -i -X POST https://epg.yourdomain.com/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"admin123"}'
+# 期望: 200 + Set-Cookie: epg_token=... + body 含 token
 
 # XMLTV 订阅应该返回 XML
 curl -I https://epg.yourdomain.com/epg.xml.gz
 # Content-Type: application/gzip ✅
 ```
 
-浏览器访问 `https://epg.yourdomain.com/admin` → 弹登录框 → `admin / admin123` ✅
+浏览器访问 `https://epg.yourdomain.com/admin` → 自动跳到 `/login` 美化登录页 → `admin / admin123` ✅
 
 ### Step 6️⃣ （可选）让 install.sh 不再插嘴
 
@@ -326,9 +349,11 @@ bash install.sh update
 |---|---|
 | 浏览器打开域名是宝塔默认页 | 站点没绑对域名 / 没解析到本机 IP |
 | `https://你的域名/admin` 返回 JSON 而不是 HTML | 反代顺序写反了，`location /` 写到 `/api/` 前面会被截胡。**确保 `location /` 在最后** |
-| `/api/v1/admin` 直接进去不要密码 | `auth_basic_user_file` 路径写错或文件不存在，检查 `ls -la /opt/epg/epg.htpasswd` |
+| `/admin` 进去仍然弹浏览器原生密码框 | 配置里还残留 `auth_basic` / `auth_basic_user_file`，删干净并 `nginx -s reload` |
+| 自定义登录页登录报 404 / Network Error | 没加 `location /api/v1/auth { ... }` 块，或后端是旧版（用 `curl https://你的域名/api/v1/auth/me` 测试） |
+| 自定义登录页登录"用户名或密码错误" | 后端找不到 htpasswd 文件。确认 `/opt/epg/epg.htpasswd` 存在，且后端启动时带了 `EPG_HTPASSWD_PATH` 环境变量（`run.sh` 默认会带） |
 | `502 Bad Gateway` | 后端没启动。`curl http://127.0.0.1:8080/health` 测试，并查 `tail /opt/epg/app/logs/server.log` |
-| 改完密码网页没掉线 | 浏览器缓存了 Basic Auth 凭证，关浏览器重开或用隐身窗口 |
+| 改完密码网页没掉线 | 旧 token 仍有效（设计如此）。点右上角"退出登录"按钮，或 `localStorage.clear()` |
 | 域名首页 404 | 网站目录写成了 `/opt/epg/app/web/epg.yourdomain.com`（多了一层）。删站点重建，根目录就填 `/opt/epg/app/web` |
 
 ---
@@ -432,6 +457,9 @@ epg-web    : 8081
 | `/api/v1/search?q=xxx` | GET | 全文检索 |
 | `/api/v1/parse-url` | POST | **解析任意外部 XMLTV URL** (body: `{"url":"..."}`，不入库) |
 | `/api/v1/theme` | GET | 获取当前主题 |
+| `/api/v1/auth/login` | POST | **登录**：body `{"username":"...","password":"..."}`，返回 token + Set-Cookie |
+| `/api/v1/auth/logout` | POST | 登出，清 Cookie |
+| `/api/v1/auth/me` | GET | 查询当前登录用户（未登录返回 401） |
 
 ### IPTV 订阅地址 (无需鉴权)
 
@@ -448,7 +476,7 @@ epg-web    : 8081
 ?channels=cctv1,cctv2 # 只导出指定频道（逗号分隔）
 ```
 
-### 管理 API (需 Basic Auth - 由 nginx 拦截)
+### 管理 API (需登录 - Cookie `epg_token` 或 `Authorization: Bearer <token>`)
 
 | 路径 | 方法 | 说明 |
 |---|---|---|
@@ -460,8 +488,10 @@ epg-web    : 8081
 | `/api/v1/admin/sync/logs` | GET | 同步日志 |
 | `/api/v1/admin/mappings/channel` | GET/POST | 频道映射 |
 | `/api/v1/admin/mappings/field` | GET/POST | 字段映射 |
-| `/api/v1/admin/change-password` | POST | 修改密码 |
+| `/api/v1/admin/change-password` | POST | 修改密码（更新 htpasswd 文件） |
 | `/api/v1/admin/theme` | POST | 设置主题 |
+
+> 💡 后端通过中间件统一拦截 `/api/v1/admin/*`，未携带有效 token 直接返回 `401 JSON`，前端 axios 自动跳 `/login`。
 
 ---
 
@@ -540,9 +570,19 @@ A: 你的 CPU 架构不在三个预编译列表里，请[从源码编译](#-从�
 
 ### Q: 后台登录失败
 A:
-1. 检查 `/opt/epg/epg.htpasswd` 是否存在
-2. 重置密码：`htpasswd -bcB /opt/epg/epg.htpasswd admin 新密码`
-3. 查看后端日志：`tail -f /opt/epg/app/logs/server.log`
+1. 检查 `/opt/epg/epg.htpasswd` 是否存在：`ls -la /opt/epg/epg.htpasswd`
+2. 重置密码（bcrypt）：`htpasswd -bcB /opt/epg/epg.htpasswd admin 新密码`
+3. 确认后端启动时带了 `EPG_HTPASSWD_PATH` 环境变量（默认 `run.sh` 已带）
+4. 查看后端日志：`tail -f /opt/epg/app/logs/server.log`
+5. 用 curl 直测登录端点：`curl -i -X POST https://你的域名/api/v1/auth/login -H 'Content-Type: application/json' -d '{"username":"admin","password":"admin123"}'`
+6. 浏览器 F12 → Network 看 `/api/v1/auth/login` 的响应内容
+
+### Q: 浏览器还在弹原生密码框（非自定义登录页）
+A: 你的 nginx 配置（特别是宝塔）里残留了 `auth_basic` / `auth_basic_user_file`，删干净并 `nginx -s reload`。验证：
+```bash
+curl -i https://你的域名/api/v1/admin/sources 2>&1 | grep -i 'WWW-Authenticate'
+# 没有任何输出 = 干净了；有 "WWW-Authenticate: Basic" = 还残留
+```
 
 ### Q: 端口冲突
 A: 改 `FRONTEND_PORT` 环境变量重新安装：`FRONTEND_PORT=9999 bash install.sh install`
@@ -565,13 +605,31 @@ A: 首页 EPG地址 输入框默认填了本站的 `/epg.xml.gz`。把它替换�
 
 ### v0.0.3 (latest)
 
+- ✨ **新增** 自定义美化登录页 `/login`（紫色渐变 + 浮动气泡 + 大圆角，告别浏览器原生 Basic Auth 弹窗）
+- ✨ **新增** 后端鉴权端点 `/api/v1/auth/login` / `/logout` / `/me`，签发签名 Token（Cookie + Bearer 双轨，7 天有效）
+- ✨ **新增** `/api/v1/admin/*` 路由全部走后端中间件鉴权，返回 401 JSON（不再带 `WWW-Authenticate: Basic` 头，前端 axios 自动跳登录）
+- ✨ **新增** 主题数量从 8 → 47（新增 复古 / Material / 深色动漫 / 极简浅深 / 商务蓝 / 玻璃拟态 / 新拟态 / 樱花 / 少年热血 / 哥特动漫 / 像素 / 全息 / 终端 / AI 科技 / 报纸 / 打字机 / 蒸汽朋克 / 胶片 / 森林 / 海洋 / 日落 / 抹茶 / 水彩 / 波普 / 日记 / 黑金 / 法式奶油 / 杂志 / 马卡龙 / 泡泡糖 / 春夏秋冬 / 圣诞 / 春节 / 万圣节 等 39 个）
 - ✨ **新增** 首页支持解析任意外部 EPG URL（`POST /api/v1/parse-url`，下载 → 解压 gzip → 解析 XMLTV → 直接展示，不入库）
 - ✨ **新增** EPG地址输入框默认填入当前域名的 `/epg.xml.gz`，开箱即用
-- 🐛 **修复** 频道列表只显示 500 个的 bug（后端 page_size 上限从 500 提到 5000，前端改为自动分页）
-- 🐛 **修复** 主页 URL 默认重定向到 `/channels` 的问题（现在停在 `/`）
-- 🔒 **安全** 后端默认绑定 `127.0.0.1`，必须经由 nginx 反代（避免管理 API 裸奔）
-- 🔒 **安全** nginx 配置加入 `auth_basic` 拦截 `/api/v1/admin/*`
+- 🐛 **修复** 自家 EPG 导出（`/epg.xml`）被 IPTV 播放器拒绝解析的 bug：移除 `<!DOCTYPE tv SYSTEM "xmltv.dtd">` 声明，`display-name` / `title` / `desc` / `category` 全部补 `lang="zh"` 属性
+- 🐛 **修复** 后端主题白名单只有 8 个，切换新主题返回 400 "无效主题"
+- 🐛 **修复** 频道列表只显示 500 个（后端 page_size 上限从 500 提到 5000，前端改为自动分页）
+- 🐛 **修复** 主页 URL 默认重定向到 `/channels`（现在停在 `/`）
+- 🔧 **改进** `install.sh update` 会自动同步 nginx 配置（v0.0.2 升级到 v0.0.3 必须，否则 `auth_basic` 残留会导致登录页失效）
+- 🔧 **改进** nginx 配置重写前自动备份为 `*.bak.YYYYMMDD-HHMMSS`，便于回滚
+- 🔒 **安全** 后端默认绑定 `127.0.0.1`，必须经由 nginx 反代
 - 🔧 **改进** axios 超时从 15s 提到 120s（解析大 EPG 包不再卡死）
+
+### ⚠️ 从 v0.0.2 升级到 v0.0.3 注意
+
+如果是 `install.sh` 一键安装的：直接 `bash install.sh update` 即可（会自动重写 nginx 配置）。
+
+如果是**宝塔面板**手动接入的，**必须手动改宝塔站点配置**：
+1. 把 `location /api/v1/admin { ... }` 块里的 `auth_basic` 和 `auth_basic_user_file` 两行**删除**
+2. **新增** `location /api/v1/auth { ... }` 块（同上面的 [宝塔教程 Step 3](#step-3️⃣-编辑站点配置文件)）
+3. `nginx -t && nginx -s reload`
+
+否则浏览器仍会弹原生密码框，新的自定义登录页也无法工作。
 
 ### v0.0.1
 
