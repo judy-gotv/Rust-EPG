@@ -236,6 +236,11 @@ setup_nginx() {
   local conf; conf="$(nginx_conf_target)"
   local web_root="$INSTALL_DIR/web"
 
+  # 升级时备份旧配置，便于回滚
+  if [ -f "$conf" ]; then
+    $SUDO cp -a "$conf" "${conf}.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+  fi
+
   # 确保 nginx 能读到目录
   $SUDO chmod 755 "$INSTALL_DIR" 2>/dev/null || true
   $SUDO chmod -R a+rX "$web_root" 2>/dev/null || true
@@ -255,25 +260,33 @@ server {
     root ${web_root};
     index index.html;
 
-    # 前端 SPA 路由 fallback
-    location / {
-        try_files \$uri \$uri/ /index.html;
-    }
+    # 前端 SPA 路由 fallback (必须放在所有 API/导出 location 之后)
+    # 公开 API、管理 API、导出路由都在前面优先匹配
 
-    # ⚠️ 管理 API - 必须放在 /api/ 之前，加 Basic Auth
-    # 后端本身不做鉴权，由 nginx 负责
+    # ⚠️ 管理 API - 由后端做登录鉴权（cookie + token），nginx 不再 auth_basic
     location /api/v1/admin {
-        auth_basic           "EPG Admin";
-        auth_basic_user_file ${HTPASSWD_PATH};
-
         proxy_pass http://127.0.0.1:${BACKEND_PORT};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Cookie \$http_cookie;
         proxy_set_header Authorization \$http_authorization;
         proxy_read_timeout 300s;
+    }
+
+    # 登录接口（公开）
+    location /api/v1/auth {
+        proxy_pass http://127.0.0.1:${BACKEND_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Cookie \$http_cookie;
+        proxy_set_header Authorization \$http_authorization;
+        proxy_read_timeout 60s;
     }
 
     # 公开 API
@@ -287,10 +300,24 @@ server {
         proxy_read_timeout 300s;
     }
 
-    # 后端健康/metrics/导出
-    location ~ ^/(health|metrics|export) {
+    # 健康检查 / Prometheus 指标
+    location ~ ^/(health|metrics)\$ {
         proxy_pass http://127.0.0.1:${BACKEND_PORT};
         proxy_set_header Host \$host;
+    }
+
+    # EPG 导出 - XMLTV / DIYP（IPTV 播放器订阅地址）
+    location ~ ^/(epg\.xml|epg\.xml\.gz|e\.xml|e\.xml\.gz|diyp|epg/diyp)\$ {
+        proxy_pass http://127.0.0.1:${BACKEND_PORT};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_read_timeout 300s;
+    }
+
+    # 前端 SPA - 兜底（必须最后）
+    location / {
+        try_files \$uri \$uri/ /index.html;
     }
 }
 EOF
@@ -407,7 +434,8 @@ print_banner() {
   echo -e "${GREEN}╚════════════════════════════════════════════╝${NC}"
   echo -e "  ${BOLD}访问地址 (nginx 已托管前端 + 反代 API)${NC}"
   echo -e "    前端首页 : ${CYAN}http://${ip}:${FRONTEND_PORT}${NC}"
-  echo -e "    后台管理 : ${CYAN}${BOLD}http://${ip}:${FRONTEND_PORT}/admin${NC}   👈 登录入口"
+  echo -e "    登录页面 : ${CYAN}${BOLD}http://${ip}:${FRONTEND_PORT}/login${NC}   👈 美化登录入口"
+  echo -e "    后台管理 : ${CYAN}http://${ip}:${FRONTEND_PORT}/admin${NC} (未登录自动跳 /login)"
   echo -e "    后端健康 : ${CYAN}http://${ip}:${FRONTEND_PORT}/health${NC}"
   echo -e "  ${BOLD}目录${NC}"
   echo -e "    安装目录 : ${INSTALL_DIR}"
@@ -467,9 +495,11 @@ do_uninstall() {
 }
 
 do_update() {
-  log "更新 = 重新下载二进制并重启"
+  log "更新 = 重新下载二进制 + 同步 nginx 配置 + 重启"
   local arch; arch="$(detect_arch)"
   download_pkg "$arch"
+  # 重新写 nginx 配置（v0.0.3 起去掉 auth_basic 改用前端登录页）
+  setup_nginx || true
   stop_services
   start_services
   print_banner "$arch"
