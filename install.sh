@@ -199,6 +199,11 @@ init_account() {
 # ---------------- 停止旧进程 ----------------
 stop_services() {
   step "停止旧服务 ..."
+  # 优先停 systemd 单元
+  if systemctl list-unit-files 2>/dev/null | grep -q '^epg-server.service'; then
+    $SUDO systemctl stop epg-server 2>/dev/null || true
+    log "  - systemctl stop epg-server"
+  fi
   for pidf in "$INSTALL_DIR/logs/server.pid"; do
     if [ -f "$pidf" ]; then
       local pid; pid="$(cat "$pidf" 2>/dev/null || true)"
@@ -215,6 +220,60 @@ stop_services() {
   if [ -f /etc/nginx/conf.d/epg.conf ] || [ -f /etc/nginx/sites-enabled/epg ]; then
     log "  - 重载 nginx (移除 EPG 配置后需要手动 stop_nginx_site)"
   fi
+}
+
+# ---------------- systemd 守护 (崩溃自愈 + 内存限制) ----------------
+# 装一个 systemd unit,实现:
+#   1) 崩溃 3 秒自动重启
+#   2) 内存超 300MB 自动重启(防止吃爆小内存机器)
+#   3) OOM 优先级降低,内核宁可杀宝塔也不杀 EPG
+#   4) 开机自启
+setup_systemd() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    warn "未检测到 systemd,跳过守护进程安装 (将回退到 nohup 模式)"
+    return 1
+  fi
+  step "安装 systemd 守护进程 (崩溃自愈 + 内存 300MB 上限)"
+
+  local unit=/etc/systemd/system/epg-server.service
+  $SUDO tee "$unit" >/dev/null <<EOF
+[Unit]
+Description=EPG Server (Rust)
+Documentation=https://github.com/${GH_REPO}
+After=network.target redis-server.service
+Wants=redis-server.service
+
+[Service]
+Type=simple
+WorkingDirectory=${INSTALL_DIR}
+Environment=EPG_HTPASSWD_PATH=${HTPASSWD_PATH}
+ExecStart=${INSTALL_DIR}/epg-server
+Restart=always
+RestartSec=3
+StandardOutput=append:${INSTALL_DIR}/logs/server.log
+StandardError=append:${INSTALL_DIR}/logs/server.log
+
+# === 内存防御 (1-2GB 小机器关键) ===
+# 涨到 300MB 直接重启,避免拖死整机 (优化版正常 12-30MB)
+MemoryMax=300M
+MemoryHigh=200M
+# 优先级降低: 内核 OOM 时优先杀别的进程
+OOMScoreAdjust=-500
+
+# === 安全加固 ===
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  $SUDO systemctl daemon-reload
+  $SUDO systemctl enable epg-server >/dev/null 2>&1 || true
+  log "  - systemd unit: $unit"
+  log "  - MemoryMax=300M, Restart=always (3s), OOMScoreAdjust=-500"
+  return 0
 }
 
 # ---------------- 检测 nginx 配置目录 ----------------
@@ -409,11 +468,21 @@ start_services() {
   fi
 
   cd "$INSTALL_DIR"
-  EPG_HTPASSWD_PATH="$HTPASSWD_PATH" \
-    nohup ./epg-server > "$INSTALL_DIR/logs/server.log" 2>&1 &
-  local spid=$!
-  echo $spid > "$INSTALL_DIR/logs/server.pid"
-  log "  - 后端 PID=$spid (监听 127.0.0.1:${BACKEND_PORT}, 仅本机, 由 nginx 反代)"
+  # 优先用 systemd 启动 (崩溃自愈 + 内存 300MB 上限)
+  if [ -f /etc/systemd/system/epg-server.service ]; then
+    $SUDO systemctl restart epg-server
+    sleep 1
+    local spid; spid="$(systemctl show -p MainPID --value epg-server 2>/dev/null)"
+    echo "$spid" > "$INSTALL_DIR/logs/server.pid"
+    log "  - 后端 PID=$spid (systemd 守护, 监听 127.0.0.1:${BACKEND_PORT})"
+  else
+    EPG_HTPASSWD_PATH="$HTPASSWD_PATH" \
+      nohup ./epg-server > "$INSTALL_DIR/logs/server.log" 2>&1 &
+    local spid=$!
+    echo $spid > "$INSTALL_DIR/logs/server.pid"
+    log "  - 后端 PID=$spid (nohup 模式, 监听 127.0.0.1:${BACKEND_PORT})"
+    warn "  - 未启用 systemd 守护,崩溃后不会自动重启! 建议手动跑: bash $0 setup-systemd"
+  fi
 
   # 前端由 nginx 托管 + 反代 API
   setup_nginx
@@ -554,6 +623,7 @@ do_install() {
   download_pkg "$arch"
   init_account
   setup_redis
+  setup_systemd
   stop_services
   start_services
   print_banner "$arch"
@@ -575,6 +645,13 @@ do_uninstall() {
     return
   fi
   stop_services
+  # 清理 systemd unit
+  if [ -f /etc/systemd/system/epg-server.service ]; then
+    $SUDO systemctl disable epg-server 2>/dev/null || true
+    $SUDO rm -f /etc/systemd/system/epg-server.service
+    $SUDO systemctl daemon-reload 2>/dev/null || true
+    log "  - 已移除 systemd unit"
+  fi
   remove_nginx_site
   $SUDO rm -rf "$INSTALL_DIR" "$EPG_DIR"
   log "✅ 已卸载并恢复原始状态"
@@ -586,6 +663,8 @@ do_update() {
   download_pkg "$arch"
   # 重新写 nginx 配置（v0.0.3 起去掉 auth_basic 改用前端登录页）
   setup_nginx || true
+  # 确保 systemd 守护已装(老用户升级时补装)
+  setup_systemd || true
   stop_services
   start_services
   print_banner "$arch"
@@ -640,6 +719,7 @@ show_menu() {
   echo -e "  ${GREEN}7)${NC}  查看实时日志"
   echo -e "  ${RED}8)${NC}  卸载 (恢复原始状态)"
   echo -e "  ${GREEN}9)${NC}  安装/修复 Redis (apt+systemd, 100MB上限)"
+  echo -e "  ${GREEN}10)${NC} 安装/修复 systemd 守护 (崩溃自愈+300MB上限)"
   echo -e "  ${YELLOW}0)${NC}  退出"
   echo -e "${BLUE}============================================${NC}"
 }
@@ -647,7 +727,7 @@ show_menu() {
 menu_loop() {
   while true; do
     show_menu
-    read -r -p "请选择 [0-9]: " choice
+    read -r -p "请选择 [0-10]: " choice
     case "$choice" in
       1) do_install auto;  read -r -p "按回车返回菜单..." _ ;;
       2)
@@ -667,6 +747,7 @@ menu_loop() {
       7) do_logs ;;
       8) do_uninstall;  read -r -p "按回车返回菜单..." _ ;;
       9) setup_redis;   read -r -p "按回车返回菜单..." _ ;;
+      10) setup_systemd && { stop_services; start_services; }; read -r -p "按回车返回菜单..." _ ;;
       0) echo "Bye 👋"; exit 0 ;;
       *) warn "无效选择: $choice"; sleep 1 ;;
     esac
@@ -686,6 +767,7 @@ case "${1:-}" in
   logs)               do_logs ;;
   uninstall|remove)   do_uninstall ;;
   redis|setup-redis)  setup_redis ;;
+  systemd|setup-systemd) setup_systemd && { stop_services; start_services; } ;;
   menu|"")            menu_loop ;;
   -h|--help|help)
     cat <<EOF
@@ -699,6 +781,7 @@ EPG 系统一键安装脚本
   bash $0 status           # 查看状态
   bash $0 logs             # 实时日志
   bash $0 redis            # 单独安装/修复 Redis
+  bash $0 systemd          # 单独安装/修复 systemd 守护 (崩溃自愈+300MB上限)
   bash $0 uninstall        # 卸载
 
 环境变量:
