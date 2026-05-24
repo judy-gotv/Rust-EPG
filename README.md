@@ -20,6 +20,7 @@
 ## ✨ 特性
 
 - 🚀 **高性能** — Rust 后端 + SQLite (bundled) + Redis 缓存,流式解析(85MB EPG 内存恒定 12-30MB)
+- 📦 **订阅秒返回** — `/epg.xml.gz` 走磁盘缓存(cron 同步完自动预生成),别人订阅你的地址 <100ms,后端零 DB 压力
 - 🛡️ **崩溃自愈** — systemd 守护进程,后端崩溃 3 秒自动重启,内存超 300MB 自动重启(防小机器 OOM)
 - 🌐 **多架构** — 预编译 `linux/amd64` `linux/arm64` `linux/arm/v7` 三个架构的二进制
 - 📦 **零依赖部署** — 静态链接 + rustls (无需 OpenSSL)，glibc 2.17 兼容 (CentOS 7+/Ubuntu 18.04+)
@@ -200,6 +201,70 @@ curl -fsSL https://github.com/judy-gotv/Rust-EPG/releases/latest/download/instal
 - **4GB 以上**: 可放宽到 `MemoryMax=500M` 甚至 `1G`
 
 改完 `systemctl daemon-reload && systemctl restart epg-server`。
+
+---
+
+## 📡 订阅地址工作原理(IPTV 用户必读)
+
+### 架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  cron (每 12 小时)                                          │
+│   └─→ 同步所有数据源 → 写入 SQLite                          │
+│        └─→ 自动预生成 /opt/epg/cache/epg-d7.xml.gz (流式)   │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│  别人订阅 https://your-domain.com/epg.xml.gz                │
+│    nginx (10 min Cache-Control)                             │
+│      └─→ epg-server: tokio::fs::read(cache.gz) → 直接返回   │
+│           **不查数据库, 不解析 XML, 不占内存**              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 关键文件
+
+| 路径 | 说明 |
+|---|---|
+| `/opt/epg/cache/epg-d7.xml.gz` | 预生成的 7 天 XMLTV (gzip) — IPTV 订阅地址直接读它 |
+| `/opt/epg/cache/epg-d7-cXXXX.xml.gz` | 带频道过滤的缓存 (按参数 hash) |
+
+### 缓存生成时机(三重保险)
+
+1. **cron 同步完毕**(每 12 小时) — 在 `scheduler.rs` 里 sync 任务结束后自动调 `ensure_gz_cache`
+2. **后台手动点「同步」** — `trigger_sync` 完成后立刻预生成
+3. **首次访问且缓存过期** — 用户 curl 触发,`tokio::sync::Mutex` 串行化,并发请求只生成一次
+
+缓存 TTL = 12 小时(和 cron 周期对齐)。中间不论被访问多少次都是直接 `fs::read` 返回文件,**后端零 DB 压力**。
+
+### 性能数据(105 万节目 + 10747 频道实测)
+
+| 场景 | 旧版本 | v0.0.17 流式版 |
+|---|---|---|
+| 首次生成耗时 | 60+ 秒(经常 OOM) | 20-40 秒 |
+| 生成时内存峰值 | 400-1600MB | 50MB |
+| 缓存命中后耗时 | 不适用 | **<100ms** |
+| 缓存命中后内存 | — | 仅 nginx + 文件 IO |
+
+### 排查: 为什么我的订阅地址访问慢?
+
+```bash
+# 1. 看缓存文件是否存在
+ls -lh /opt/epg/cache/
+
+# 2. 看后端有没有触发生成(应该秒返回, 不是 30 秒+)
+time curl -sI http://127.0.0.1:8080/epg.xml.gz
+
+# 3. 强制预生成一次
+systemctl restart epg-server
+curl -s -o /dev/null http://127.0.0.1:8080/epg.xml.gz   # 等 20-40 秒
+ls -lh /opt/epg/cache/
+
+# 4. 看 cron 是否在跑
+systemctl status epg-server | grep -i cron
+journalctl -u epg-server | grep -E "预生成|同步" | tail
+```
 
 ---
 
@@ -789,7 +854,29 @@ A: v0.0.3 已专门优化:
 
 ## 📝 Changelog
 
-### v0.0.3 (latest)
+### v0.0.17 (latest)
+
+- 🚀 **重大优化** `/epg.xml.gz` 完全走磁盘缓存,**别人访问你的订阅地址不再触发任何 DB 查询**:
+  - cron 12 小时同步完毕 → **自动预生成** `/opt/epg/cache/epg-d7.xml.gz` 落盘
+  - 别人 `curl /epg.xml.gz` → nginx → 后端 `tokio::fs::read` 文件直返(<100ms)
+  - 12 小时缓存 TTL,过期前后端零 DB 压力,1000 并发也只是 nginx + 一次文件读
+- 🚀 **流式生成** `build_xmltv` 改写为流式: SQLite 边查边 `GzEncoder::write_all` 写文件,**RSS 峰值从 500MB → 50MB**(105 万节目实测)
+  - 不再在内存里拼超大 String
+  - 不再做 105 万行的 `ORDER BY` 排序
+  - 全量导出去掉 `IN (10000+ id)` 巨型子句(SQLite 规划器爆炸的元凶)
+  - SQLite 索引 `idx_prog_status_time` 加快时间窗扫描
+- 🛡️ **install.sh 修复** 新装/升级自动:
+  - 建 `${EPG_DIR}/cache` 目录(原先要手动 mkdir)
+  - systemd unit 注入 `Environment=EPG_CACHE_DIR=${EPG_DIR}/cache`(原先默认 `./cache` 在 systemd 私有目录里失效)
+  - nginx 给 `/epg.xml.gz` 加 `Cache-Control: public, max-age=600` + `expires 10m`(浏览器/IPTV 客户端/CDN 10 分钟内零回源)
+- 🛡️ **预生成时机三重保险**:
+  - cron 同步完毕(`scheduler.rs`)
+  - 后台手动点同步完毕(`admin.rs trigger_sync`)
+  - 用户首次访问且缓存过期(`tokio::sync::Mutex` 串行化,并发请求复用一次生成)
+- 🐛 **修复** 启动时自动预生成会与 sync 任务争抢 r2d2 连接池导致死锁(`futex_wait_queue`),改为同步后才预生成,且 `build_xmltv` 用独立只读连接 `rusqlite::Connection::open_with_flags` 绕过连接池
+- 🔧 **改进** README 增加「订阅地址工作原理」章节,讲清楚缓存逻辑
+
+### v0.0.3
 
 - 🚀 **极致优化** 在线解析外部 EPG(10000+ 频道大源加载从 30-60 秒 → 5-10 秒,前端不再卡死):
   - **接口拆分**:`/parse-url` 只返频道列表(几百 KB),`/parse-url/programs` 按需拉单频道节目
