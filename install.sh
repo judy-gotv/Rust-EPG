@@ -207,7 +207,8 @@ stop_services() {
   for pidf in "$INSTALL_DIR/logs/server.pid"; do
     if [ -f "$pidf" ]; then
       local pid; pid="$(cat "$pidf" 2>/dev/null || true)"
-      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      # ⚠️ 关键: pid > 0 才能 kill, 否则 kill 0 会杀整个进程组(包括脚本自己!)
+      if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null && kill -0 "$pid" 2>/dev/null; then
         kill "$pid" 2>/dev/null || true
         log "  - 已停止后端 PID=$pid"
       fi
@@ -474,9 +475,19 @@ start_services() {
   # 优先用 systemd 启动 (崩溃自愈 + 内存 300MB 上限)
   if [ -f /etc/systemd/system/epg-server.service ]; then
     $SUDO systemctl restart epg-server
-    sleep 1
-    local spid; spid="$(systemctl show -p MainPID --value epg-server 2>/dev/null)"
-    echo "$spid" > "$INSTALL_DIR/logs/server.pid"
+    # 等 systemd 回填 MainPID(刚 restart 1s 内可能仍是 0,死循环最多 5s)
+    local spid=0 i=0
+    while [ "$i" -lt 10 ] && { [ "$spid" = "0" ] || [ -z "$spid" ]; }; do
+      sleep 0.5
+      spid="$(systemctl show -p MainPID --value epg-server 2>/dev/null)"
+      i=$((i+1))
+    done
+    # 只在拿到真实 PID 时才写 pid 文件,避免后续 stop 误把 0 当 pid 杀掉自己
+    if [ -n "$spid" ] && [ "$spid" != "0" ]; then
+      echo "$spid" > "$INSTALL_DIR/logs/server.pid"
+    else
+      rm -f "$INSTALL_DIR/logs/server.pid"
+    fi
     log "  - 后端 PID=$spid (systemd 守护, 监听 127.0.0.1:${BACKEND_PORT})"
   else
     EPG_HTPASSWD_PATH="$HTPASSWD_PATH" \
