@@ -136,7 +136,7 @@ prepare_basics() {
 # ---------------- 准备目录 ----------------
 prepare_dirs() {
   step "准备目录 $EPG_DIR ..."
-  $SUDO mkdir -p "$EPG_DIR"/{data,logs,conf} "$INSTALL_DIR"
+  $SUDO mkdir -p "$EPG_DIR"/{data,logs,conf,cache} "$INSTALL_DIR"
   local U G
   U="$(id -un)"; G="$(id -gn)"
   $SUDO chown -R "$U:$G" "$EPG_DIR" 2>/dev/null || true
@@ -251,6 +251,7 @@ Wants=redis-server.service
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
 Environment=EPG_HTPASSWD_PATH=${HTPASSWD_PATH}
+Environment=EPG_CACHE_DIR=${EPG_DIR}/cache
 ExecStart=${INSTALL_DIR}/epg-server
 Restart=always
 RestartSec=3
@@ -369,13 +370,25 @@ server {
         proxy_set_header Host \$host;
     }
 
-    # EPG 导出 - XMLTV / DIYP（IPTV 播放器订阅地址）
-    location ~ ^/(epg\.xml|epg\.xml\.gz|e\.xml|e\.xml\.gz|diyp|epg/diyp)\$ {
+    # EPG 导出 - XMLTV 订阅地址(走磁盘缓存,12 小时一次)
+    # 加浏览器/CDN 长缓存,减少回源
+    location ~ ^/(epg\.xml|epg\.xml\.gz|e\.xml|e\.xml\.gz)\$ {
         proxy_pass http://127.0.0.1:${BACKEND_PORT};
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_read_timeout 300s;
+        add_header Cache-Control "public, max-age=600" always;
+        expires 10m;
+    }
+
+    # DIYP / 超级直播 单频道接口(JSON,5 分钟缓存)
+    location ~ ^/(diyp|epg/diyp)\$ {
+        proxy_pass http://127.0.0.1:${BACKEND_PORT};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_read_timeout 60s;
     }
 
     # 前端 SPA - 兜底（必须最后）
