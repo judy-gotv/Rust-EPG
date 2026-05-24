@@ -214,7 +214,10 @@ stop_services() {
       rm -f "$pidf"
     fi
   done
-  pkill -f "$INSTALL_DIR/epg-server" 2>/dev/null || true
+  # 精确匹配二进制文件名(避免 pkill -f 误杀当前 bash:
+  # curl ... | bash -s update 时 bash 的命令行会包含脚本全文,
+  # 含 "/opt/epg/app/epg-server" 字符串 → -f 匹配会把自己杀掉)
+  pkill -x epg-server 2>/dev/null || true
 
   # 停止 nginx 中 EPG 站点（保留 nginx 本身）
   if [ -f /etc/nginx/conf.d/epg.conf ] || [ -f /etc/nginx/sites-enabled/epg ]; then
