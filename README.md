@@ -19,7 +19,8 @@
 
 ## ✨ 特性
 
-- 🚀 **高性能** — Rust 后端 + SQLite (bundled) + Redis 缓存
+- 🚀 **高性能** — Rust 后端 + SQLite (bundled) + Redis 缓存,流式解析(85MB EPG 内存恒定 12-30MB)
+- 🛡️ **崩溃自愈** — systemd 守护进程,后端崩溃 3 秒自动重启,内存超 300MB 自动重启(防小机器 OOM)
 - 🌐 **多架构** — 预编译 `linux/amd64` `linux/arm64` `linux/arm/v7` 三个架构的二进制
 - 📦 **零依赖部署** — 静态链接 + rustls (无需 OpenSSL)，glibc 2.17 兼容 (CentOS 7+/Ubuntu 18.04+)
 - 🔌 **多源采集** — 支持 XMLTV / JSON / CSV 数据源，定时同步
@@ -70,8 +71,10 @@ curl -fsSL https://github.com/judy-gotv/Rust-EPG/releases/latest/download/instal
 3. ✅ 创建 `/opt/epg` 数据目录
 4. ✅ 从 GitHub 下载对应架构的二进制包
 5. ✅ 创建默认账号 `admin / admin123`
-6. ✅ 配置 nginx 反向代理（**仅占用 8081 端口，不抢 80/443**）
-7. ✅ 启动后端服务
+6. ✅ **自动安装 Redis** (apt/yum,设 maxmemory 100MB + LRU 淘汰,systemd 接管)
+7. ✅ **安装 systemd 守护进程**(崩溃 3 秒自愈 + 内存 300MB 上限 + OOM 优先级保护)
+8. ✅ 配置 nginx 反向代理（**仅占用 8081 端口，不抢 80/443**）
+9. ✅ 启动后端服务
 
 ### 访问
 
@@ -104,6 +107,8 @@ curl -fsSL https://github.com/judy-gotv/Rust-EPG/releases/latest/download/instal
   6)  查看运行状态
   7)  查看实时日志
   8)  卸载 (恢复原始状态)
+  9)  安装/修复 Redis (apt+systemd, 100MB上限)
+  10) 安装/修复 systemd 守护 (崩溃自愈+300MB上限)
   0)  退出
 ============================================
 ```
@@ -118,6 +123,8 @@ bash install.sh start           # 启动
 bash install.sh stop            # 停止
 bash install.sh status          # 查看状态
 bash install.sh logs            # 实时日志
+bash install.sh redis           # 单独安装/修复 Redis
+bash install.sh systemd         # 单独安装/修复 systemd 守护
 bash install.sh uninstall       # 卸载（恢复原始状态）
 bash install.sh help            # 帮助
 ```
@@ -145,6 +152,54 @@ bash install.sh help            # 帮助
 ```
 
 升级时只覆盖 `app/`，**数据库和账号永远不丢**。
+
+---
+
+## 🛡️ systemd 守护进程 (崩溃自愈 + 内存防御)
+
+**v0.0.3 起 `install.sh` 默认安装 systemd 单元 `epg-server.service`**,实现:
+
+| 防御 | 说明 |
+|---|---|
+| ✅ 崩溃 3 秒自愈 | `Restart=always` `RestartSec=3`,后端 panic 或被 kill 立即拉起 |
+| ✅ 内存 300MB 上限 | `MemoryMax=300M`,超限自动重启,**防止吃爆 1-2GB 小机器** |
+| ✅ 内存预压 200MB | `MemoryHigh=200M`,达到后内核开始施加内存压力 |
+| ✅ OOM 优先级保护 | `OOMScoreAdjust=-500`,系统内存紧张时**优先杀宝塔/php-fpm,不杀 EPG** |
+| ✅ 开机自启 | 服务器重启自动起 |
+| ✅ 依赖 Redis | Redis 先起,后端再起 |
+| ✅ 安全加固 | `NoNewPrivileges` `ProtectSystem=full` `PrivateTmp=true` |
+
+### 常用命令
+
+```bash
+systemctl status epg-server                         # 状态
+journalctl -u epg-server -f                         # 实时日志
+systemctl restart epg-server                        # 重启
+systemctl show epg-server -p MemoryCurrent -p NRestarts
+# MemoryCurrent=12345678   ← 当前 RSS(字节)
+# NRestarts=3              ← 自动重启了 3 次(>0 说明触发过保护)
+```
+
+### 老用户(v0.0.2 升级)如何补装?
+
+旧版本是 `nohup` 启动,没有任何防御,**强烈建议**手动补装:
+
+```bash
+bash install.sh systemd
+# 或一行命令:
+curl -fsSL https://github.com/judy-gotv/Rust-EPG/releases/latest/download/install.sh | bash -s systemd
+```
+
+之后 `bash install.sh update` 也会自动检测并补装。
+
+### 调整内存上限
+
+`MemoryMax=300M` 对优化版(平均 12-30MB)留了 10x 余量。如果你机器是:
+
+- **512MB 极小内存**: `sed -i 's/MemoryMax=300M/MemoryMax=150M/' /etc/systemd/system/epg-server.service`
+- **4GB 以上**: 可放宽到 `MemoryMax=500M` 甚至 `1G`
+
+改完 `systemctl daemon-reload && systemctl restart epg-server`。
 
 ---
 
@@ -590,6 +645,62 @@ A: 改 `FRONTEND_PORT` 环境变量重新安装：`FRONTEND_PORT=9999 bash insta
 ### Q: 升级后数据丢失
 A: 不会。升级（菜单选项 3）只覆盖二进制，`/opt/epg/data/epg.db` 不动。
 
+### Q: 浏览器经常 502 Bad Gateway / 接口报错怎么办?
+A: 502 = nginx 上游(EPG 后端)挂了。**v0.0.3 已默认安装 systemd 守护,崩溃 3 秒自愈**,大多数 502 会自动恢复。手动排查 4 步:
+
+```bash
+# 1. 后端是否在跑
+curl -i http://127.0.0.1:8080/health
+systemctl status epg-server --no-pager -l | head -10
+
+# 2. 看是不是 OOM 被杀(小内存机器最常见)
+dmesg -T | grep -iE 'killed.*epg-server|out of memory' | tail -5
+# 如果有 "Killed process ... epg-server"  → 内存爆了,见下面
+
+# 3. 看后端日志最后 50 行
+journalctl -u epg-server --no-pager -l | tail -50
+# 或 tail -50 /opt/epg/app/logs/server.log
+
+# 4. 手动重启
+systemctl restart epg-server          # systemd 用户
+/opt/epg/app/run.sh restart           # 老用户(没装 systemd)
+```
+
+**根治 OOM(1-2GB 小机器):**
+1. 升级到 v0.0.3 二进制:`bash install.sh update`(本版内存峰值从 1.6GB 砍到 12-30MB)
+2. 补装 systemd 守护:`bash install.sh systemd`(超 300MB 自动重启,防整机崩)
+3. 装 Redis:`bash install.sh redis`(减少重复 DB 查询)
+4. 宝塔用户:卸宝塔可直接省 300-500MB,1GB 小鸡上宝塔是奢侈品
+
+### Q: systemd 启动失败 / 状态显示 failed
+A:
+```bash
+systemctl status epg-server --no-pager -l
+journalctl -u epg-server --no-pager -l | tail -30
+
+# 常见原因:
+# 1. 二进制权限:  chmod +x /opt/epg/app/epg-server
+# 2. 端口被占:    ss -tlnp | grep 8080 → kill 占用进程
+# 3. htpasswd 路径错: 检查 /etc/systemd/system/epg-server.service 里 EPG_HTPASSWD_PATH
+# 4. 内存上限太低:把 MemoryMax=300M 调到 500M 重试
+
+# 重置失败计数:
+systemctl reset-failed epg-server
+systemctl restart epg-server
+```
+
+### Q: 1.9GB 内存为啥还不够用?
+A: 你装了**宝塔面板**就会这样,宝塔 + BT-Task + BT-Total + php-fpm 自己就吃 300-500MB,1.9GB 真实可用只剩 1.4GB。优化措施:
+- 装 systemd 守护:`bash install.sh systemd`(自动限 EPG 内存 300MB)
+- 不需要宝塔的话**卸了它**,可省 300-500MB
+- 开 zram(虚拟内存压缩,几乎零开销):
+  ```bash
+  apt install -y zram-tools
+  echo -e "ALGO=zstd\nPERCENT=50" > /etc/default/zramswap
+  systemctl restart zramswap
+  free -h    # 多 ~900MB swap
+  ```
+
 ### Q: Redis 必须装吗？
 A: 不必须，没装就关闭缓存，性能会差一点。推荐安装，特别是小内存机器（≤2GB）开启缓存后接口响应明显更快。
 
@@ -667,6 +778,15 @@ A: 首页 EPG地址 输入框默认填了本站的 `/epg.xml.gz`。把它替换�
 
 ### v0.0.3 (latest)
 
+- 🛡️ **新增** systemd 守护进程 `epg-server.service`(install.sh 默认安装):崩溃 3 秒自愈 + 内存 300MB 上限 + OOMScoreAdjust=-500(小机器永久告别 502)
+- 🚀 **新增** install.sh 自动安装 Redis(apt/yum + maxmemory 100MB + LRU 淘汰 + systemd 接管)
+- 🚀 **重大优化** XMLTV 流式解析:85MB EPG 同步内存峰值从 ~1.6GB → 12-30MB(降 50 倍),小机器不再 OOM
+  - 流式下载到临时文件(不再 `bytes().await`)
+  - 流式 XML 解析回调入库(不再全量 `Vec<Programme>`)
+  - 1000 → 500 条一批 INSERT
+  - tokio worker_threads=2(原默认 = CPU 核数)
+  - SQLite mmap 64MB→16MB / cache 20MB→8MB
+  - reqwest 连接池 max_idle=2
 - ✨ **新增** 自定义美化登录页 `/login`（紫色渐变 + 浮动气泡 + 大圆角，告别浏览器原生 Basic Auth 弹窗）
 - ✨ **新增** 后端鉴权端点 `/api/v1/auth/login` / `/logout` / `/me`，签发签名 Token（Cookie + Bearer 双轨，7 天有效）
 - ✨ **新增** `/api/v1/admin/*` 路由全部走后端中间件鉴权，返回 401 JSON（不再带 `WWW-Authenticate: Basic` 头，前端 axios 自动跳登录）
