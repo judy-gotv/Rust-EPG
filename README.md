@@ -398,12 +398,19 @@ location ~ ^/(health|metrics)$ {
 }
 
 # EPG 订阅地址 (XMLTV / DIYP)
-location ~ ^/(epg\.xml|epg\.xml\.gz|e\.xml|e\.xml\.gz|diyp|epg/diyp)$ {
+# XMLTV 订阅 - 走磁盘缓存, 浏览器/IPTV 客户端 10 分钟缓存
+location ~ ^/(epg\.xml|epg\.xml\.gz|e\.xml|e\.xml\.gz)$ {
     proxy_pass http://127.0.0.1:8080;
     proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_read_timeout 300s;
+    add_header Cache-Control "public, max-age=600" always;
+    expires 10m;
+}
+# DIYP 单频道 JSON - 短缓存
+location ~ ^/(diyp|epg/diyp)$ {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Host $host;
+    proxy_read_timeout 60s;
 }
 
 # 前端 SPA - 必须放最后（兜底）
