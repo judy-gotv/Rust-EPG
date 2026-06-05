@@ -39,6 +39,7 @@ HTPASSWD_PATH="${EPG_HTPASSWD_PATH:-$EPG_DIR/epg.htpasswd}"
 
 # GitHub 下载地址 (Releases - latest 自动指向最新版本)
 GH_REPO="judy-gotv/Rust-EPG"
+EPG_VERSION="${EPG_VERSION:-v0.0.18}"
 GH_RELEASE_TAG="${GH_RELEASE_TAG:-latest}"   # 可指定具体版本号，如 0.0.1
 if [ "$GH_RELEASE_TAG" = "latest" ]; then
   GH_BASE="https://github.com/${GH_REPO}/releases/latest/download"
@@ -168,12 +169,20 @@ download_pkg() {
   [ -d "$pkgdir" ] || pkgdir="$(find "$extract_tmp" -mindepth 1 -maxdepth 1 -type d | head -1)"
   [ -d "$pkgdir" ] || error "解压后未找到包目录"
 
-  # 备份旧 config（保留用户修改）
-  [ -f "$INSTALL_DIR/config.yml" ] && cp "$INSTALL_DIR/config.yml" "$INSTALL_DIR/config.yml.bak.$(date +%s)" || true
+  # 备份旧 config，升级时保留用户修改；新装时使用包内默认 config.yml
+  local config_bak=""
+  if [ -f "$INSTALL_DIR/config.yml" ]; then
+    config_bak="$INSTALL_DIR/config.yml.bak.$(date +%s)"
+    cp "$INSTALL_DIR/config.yml" "$config_bak" || true
+  fi
 
   # 复制文件（覆盖二进制和前端，保留 config 备份）
   $SUDO mkdir -p "$INSTALL_DIR"
   $SUDO cp -rf "$pkgdir"/* "$INSTALL_DIR/"
+  if [ -n "$config_bak" ] && [ -f "$config_bak" ]; then
+    $SUDO cp -f "$config_bak" "$INSTALL_DIR/config.yml"
+    log "  - 已保留原配置: $INSTALL_DIR/config.yml (备份: $config_bak)"
+  fi
   $SUDO chmod +x "$INSTALL_DIR/epg-server" "$INSTALL_DIR/run.sh" 2>/dev/null || true
 
   rm -rf "$extract_tmp" "$tmp"
@@ -534,6 +543,7 @@ print_banner() {
   echo -e "    后台管理 : ${CYAN}http://${ip}:${FRONTEND_PORT}/admin${NC} (未登录自动跳 /login)"
   echo -e "    后端健康 : ${CYAN}http://${ip}:${FRONTEND_PORT}/health${NC}"
   echo -e "  ${BOLD}目录${NC}"
+  echo -e "    当前版本 : ${CYAN}${EPG_VERSION}${NC}"
   echo -e "    安装目录 : ${INSTALL_DIR}"
   echo -e "    数据目录 : ${EPG_DIR}"
   echo -e "    nginx    : $(nginx_conf_target)"
@@ -733,6 +743,7 @@ show_menu() {
   echo -e "${BLUE}║${NC}     ${CYAN}https://github.com/judy-gotv/Rust-EPG${NC}  ${BLUE}║${NC}"
   echo -e "${BLUE}╚════════════════════════════════════════════╝${NC}"
   echo -e "  当前架构 : ${CYAN}${arch}${NC} ($(uname -m))"
+  echo -e "  当前版本 : ${CYAN}${EPG_VERSION}${NC}"
   echo -e "  安装目录 : ${CYAN}${INSTALL_DIR}${NC}"
   echo -e "  数据目录 : ${CYAN}${EPG_DIR}${NC}"
   echo -e "  端  口   : 后端 ${CYAN}${BACKEND_PORT}${NC} / 前端 ${CYAN}${FRONTEND_PORT}${NC}"
